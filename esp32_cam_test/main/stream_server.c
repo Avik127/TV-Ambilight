@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "camera_app.h"
@@ -73,6 +74,30 @@ static int read_query_int(httpd_req_t *req, const char *key, int fallback, int m
     return value;
 }
 
+static bool json_append(char *dst, size_t cap, size_t *len, const char *fmt, ...)
+{
+    if (!dst || !len || *len >= cap) {
+        return false;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(dst + *len, cap - *len, fmt, args);
+    va_end(args);
+
+    if (written < 0) {
+        return false;
+    }
+
+    size_t w = (size_t)written;
+    if (w >= (cap - *len)) {
+        return false;
+    }
+
+    *len += w;
+    return true;
+}
+
 static esp_err_t jpg_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = camera_app_get_frame();
@@ -117,18 +142,24 @@ static esp_err_t edge_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    int n = snprintf(
-        json,
-        json_cap,
-        "{\"mode\":\"rgb565\",\"width\":%d,\"height\":%d,\"segments_per_edge\":%d,\"sample_depth\":%d,\"edges\":{",
-        width,
-        height,
-        segments,
-        depth);
+    size_t n = 0;
+    if (!json_append(json, json_cap, &n,
+                     "{\"mode\":\"rgb565\",\"width\":%d,\"height\":%d,\"segments_per_edge\":%d,\"sample_depth\":%d,\"edges\":{",
+                     width, height, segments, depth)) {
+        free(json);
+        camera_app_return_frame(fb);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to build edge payload");
+        return ESP_FAIL;
+    }
 
     const char *edge_names[4] = {"top", "right", "bottom", "left"};
     for (int edge = 0; edge < 4; edge++) {
-        n += snprintf(json + n, json_cap - (size_t)n, "\"%s\":[", edge_names[edge]);
+        if (!json_append(json, json_cap, &n, "\"%s\":[", edge_names[edge])) {
+            free(json);
+            camera_app_return_frame(fb);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to build edge payload");
+            return ESP_FAIL;
+        }
 
         for (int s = 0; s < segments; s++) {
             long long sum_r = 0;
@@ -178,43 +209,30 @@ static esp_err_t edge_handler(httpd_req_t *req)
             int avg_g = (count > 0) ? (int)(sum_g / count) : 0;
             int avg_b = (count > 0) ? (int)(sum_b / count) : 0;
 
-            n += snprintf(json + n, json_cap - (size_t)n,
-                          "%s{\"r\":%d,\"g\":%d,\"b\":%d}",
-                          (s == 0) ? "" : ",", avg_r, avg_g, avg_b);
+            if (!json_append(json, json_cap, &n, "%s{\"r\":%d,\"g\":%d,\"b\":%d}",
+                             (s == 0) ? "" : ",", avg_r, avg_g, avg_b)) {
+                free(json);
+                camera_app_return_frame(fb);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to build edge payload");
+                return ESP_FAIL;
+            }
         }
 
-        n += snprintf(json + n, json_cap - (size_t)n, "]%s", (edge == 3) ? "" : ",");
-    }
-    for (int x = width - border; x < width; x++) {
-        if (x < 0) continue;
-        for (int y = 0; y < height; y++) {
-            uint8_t r, g, b;
-            rgb565_to_rgb888(pixels[y * width + x], &r, &g, &b);
-            rr += r; gr += g; br += b; cr++;
+        if (!json_append(json, json_cap, &n, "]%s", (edge == 3) ? "" : ",")) {
+            free(json);
+            camera_app_return_frame(fb);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to build edge payload");
+            return ESP_FAIL;
         }
     }
 
-    char payload[220];
-    int n = snprintf(
-        payload, sizeof(payload),
-        "{\"mode\":\"rgb565\",\"top\":{\"r\":%u,\"g\":%u,\"b\":%u},"
-        "\"bottom\":{\"r\":%u,\"g\":%u,\"b\":%u},"
-        "\"left\":{\"r\":%u,\"g\":%u,\"b\":%u},"
-        "\"right\":{\"r\":%u,\"g\":%u,\"b\":%u}}",
-        ct ? (unsigned)(rt / ct) : 0, ct ? (unsigned)(gt / ct) : 0, ct ? (unsigned)(bt / ct) : 0,
-        cb ? (unsigned)(rb / cb) : 0, cb ? (unsigned)(gb / cb) : 0, cb ? (unsigned)(bb / cb) : 0,
-        cl ? (unsigned)(rl / cl) : 0, cl ? (unsigned)(gl / cl) : 0, cl ? (unsigned)(bl / cl) : 0,
-        cr ? (unsigned)(rr / cr) : 0, cr ? (unsigned)(gr / cr) : 0, cr ? (unsigned)(br / cr) : 0
-    );
-
-    n += snprintf(json + n, json_cap - (size_t)n, "}}\n");
-    camera_app_return_frame(fb);
-
-    if (n <= 0 || (size_t)n >= json_cap) {
+    if (!json_append(json, json_cap, &n, "}}\n")) {
         free(json);
+        camera_app_return_frame(fb);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to build edge payload");
         return ESP_FAIL;
     }
+    camera_app_return_frame(fb);
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t res = httpd_resp_send(req, json, n);
