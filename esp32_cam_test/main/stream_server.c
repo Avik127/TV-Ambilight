@@ -1,36 +1,11 @@
 #include "stream_server.h"
 #include <string.h>
-#include <stdlib.h>
 #include "esp_log.h"
 #include "esp_http_server.h"
 #include "camera_app.h"
 
 static const char *TAG = "stream_server";
 static const int SW_JPEG_QUALITY = 20;
-
-static esp_err_t send_frame_as_jpeg(httpd_req_t *req, camera_fb_t *fb, bool chunked)
-{
-    esp_err_t res;
-    if (fb->format == PIXFORMAT_JPEG) {
-        return chunked
-            ? httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len)
-            : httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    }
-
-    uint8_t *jpg_buf = NULL;
-    size_t jpg_len = 0;
-    bool converted = frame2jpg(fb, SW_JPEG_QUALITY, &jpg_buf, &jpg_len);
-    if (!converted || !jpg_buf) {
-        ESP_LOGE(TAG, "Software JPEG conversion failed");
-        return ESP_FAIL;
-    }
-
-    res = chunked
-        ? httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len)
-        : httpd_resp_send(req, (const char *)jpg_buf, jpg_len);
-    free(jpg_buf);
-    return res;
-}
 
 static esp_err_t jpg_handler(httpd_req_t *req)
 {
@@ -41,7 +16,7 @@ static esp_err_t jpg_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "image/jpeg");
-    esp_err_t res = send_frame_as_jpeg(req, fb, false);
+    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
     camera_app_return_frame(fb);
     return res;
 }
