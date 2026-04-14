@@ -24,7 +24,7 @@ static const char *TAG = "camera_app";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-esp_err_t camera_app_init(void)
+static esp_err_t camera_init_rgb565(void)
 {
     camera_config_t config = {
         .pin_pwdn     = PWDN_GPIO_NUM,
@@ -50,23 +50,33 @@ esp_err_t camera_app_init(void)
         .ledc_channel = LEDC_CHANNEL_0,
 
         .pixel_format = PIXFORMAT_RGB565,
-        .frame_size   = FRAMESIZE_QVGA,
+        .frame_size   = FRAMESIZE_UXGA,
+        .jpeg_quality = 12,
         .fb_count     = 1,
         .grab_mode    = CAMERA_GRAB_LATEST,
         .fb_location  = CAMERA_FB_IN_PSRAM,
     };
 
-    esp_err_t err = esp_camera_init(&config);
+    return esp_camera_init(&config);
+}
+
+esp_err_t camera_app_init(void)
+{
+    esp_err_t err = camera_init_rgb565();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
         return err;
     }
 
+    ESP_LOGI(TAG, "Camera initialized in RGB565 mode at UXGA");
+
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
+        s->set_framesize(s, FRAMESIZE_UXGA);
         s->set_brightness(s, 0);
         s->set_contrast(s, 0);
         s->set_saturation(s, 0);
+        s->set_sharpness(s, 1);
     }
 
     ESP_LOGI(TAG, "Camera initialized");
