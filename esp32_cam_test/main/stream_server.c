@@ -5,6 +5,7 @@
 #include "camera_app.h"
 
 static const char *TAG = "stream_server";
+static const int SW_JPEG_QUALITY = 20;
 
 static esp_err_t jpg_handler(httpd_req_t *req)
 {
@@ -24,8 +25,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
 {
     static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
     static const char *BOUNDARY = "\r\n--frame\r\n";
-    static const char *PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
-    char part_header[64];
+    static const char *PART = "Content-Type: image/jpeg\r\n\r\n";
 
     httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -37,13 +37,12 @@ static esp_err_t stream_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        int header_len = snprintf(part_header, sizeof(part_header), PART, fb->len);
         esp_err_t res = httpd_resp_send_chunk(req, BOUNDARY, strlen(BOUNDARY));
         if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, part_header, header_len);
+            res = httpd_resp_send_chunk(req, PART, strlen(PART));
         }
         if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+            res = send_frame_as_jpeg(req, fb, true);
         }
 
         camera_app_return_frame(fb);
