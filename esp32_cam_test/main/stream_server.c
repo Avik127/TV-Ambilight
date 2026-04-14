@@ -185,6 +185,27 @@ static esp_err_t edge_handler(httpd_req_t *req)
 
         n += snprintf(json + n, json_cap - (size_t)n, "]%s", (edge == 3) ? "" : ",");
     }
+    for (int x = width - border; x < width; x++) {
+        if (x < 0) continue;
+        for (int y = 0; y < height; y++) {
+            uint8_t r, g, b;
+            rgb565_to_rgb888(pixels[y * width + x], &r, &g, &b);
+            rr += r; gr += g; br += b; cr++;
+        }
+    }
+
+    char payload[220];
+    int n = snprintf(
+        payload, sizeof(payload),
+        "{\"mode\":\"rgb565\",\"top\":{\"r\":%u,\"g\":%u,\"b\":%u},"
+        "\"bottom\":{\"r\":%u,\"g\":%u,\"b\":%u},"
+        "\"left\":{\"r\":%u,\"g\":%u,\"b\":%u},"
+        "\"right\":{\"r\":%u,\"g\":%u,\"b\":%u}}",
+        ct ? (unsigned)(rt / ct) : 0, ct ? (unsigned)(gt / ct) : 0, ct ? (unsigned)(bt / ct) : 0,
+        cb ? (unsigned)(rb / cb) : 0, cb ? (unsigned)(gb / cb) : 0, cb ? (unsigned)(bb / cb) : 0,
+        cl ? (unsigned)(rl / cl) : 0, cl ? (unsigned)(gl / cl) : 0, cl ? (unsigned)(bl / cl) : 0,
+        cr ? (unsigned)(rr / cr) : 0, cr ? (unsigned)(gr / cr) : 0, cr ? (unsigned)(br / cr) : 0
+    );
 
     n += snprintf(json + n, json_cap - (size_t)n, "}}\n");
     camera_app_return_frame(fb);
@@ -228,7 +249,11 @@ static esp_err_t root_handler(httpd_req_t *req)
         "</script></body></html>";
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    if (camera_app_is_jpeg_mode()) {
+        httpd_resp_send(req, html_jpeg, HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send(req, html_rgb565, HTTPD_RESP_USE_STRLEN);
+    }
     return ESP_OK;
 }
 
