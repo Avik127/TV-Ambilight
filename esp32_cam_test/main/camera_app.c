@@ -4,6 +4,7 @@
 #include "esp_camera.h"
 
 static const char *TAG = "camera_app";
+static bool s_jpeg_mode = false;
 
 // AI Thinker / common ESP32-CAM pin map
 #define PWDN_GPIO_NUM     32
@@ -24,7 +25,7 @@ static const char *TAG = "camera_app";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-esp_err_t camera_app_init(void)
+static esp_err_t camera_init_with_format(pixformat_t pixel_format, framesize_t frame_size, int fb_count)
 {
     camera_config_t config = {
         .pin_pwdn     = PWDN_GPIO_NUM,
@@ -49,15 +50,34 @@ esp_err_t camera_app_init(void)
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
-        .pixel_format = PIXFORMAT_RGB565,
-        .frame_size   = FRAMESIZE_QVGA,
-        .fb_count     = 1,
+        .pixel_format = pixel_format,
+        .frame_size   = frame_size,
+        .jpeg_quality = 15,
+        .fb_count     = fb_count,
         .grab_mode    = CAMERA_GRAB_LATEST,
         .fb_location  = CAMERA_FB_IN_PSRAM,
     };
 
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
+    return esp_camera_init(&config);
+}
+
+esp_err_t camera_app_init(void)
+{
+    esp_err_t err = camera_init_with_format(PIXFORMAT_JPEG, FRAMESIZE_QVGA, 2);
+    if (err == ESP_OK) {
+        s_jpeg_mode = true;
+        ESP_LOGI(TAG, "Camera initialized in JPEG mode");
+    } else if (err == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "Sensor does not support JPEG, falling back to RGB565");
+        esp_camera_deinit();
+        err = camera_init_with_format(PIXFORMAT_RGB565, FRAMESIZE_QQVGA, 1);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "RGB565 fallback init failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        s_jpeg_mode = false;
+        ESP_LOGI(TAG, "Camera initialized in RGB565 fallback mode");
+    } else {
         ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
         return err;
     }
@@ -71,6 +91,11 @@ esp_err_t camera_app_init(void)
 
     ESP_LOGI(TAG, "Camera initialized");
     return ESP_OK;
+}
+
+bool camera_app_is_jpeg_mode(void)
+{
+    return s_jpeg_mode;
 }
 
 camera_fb_t *camera_app_get_frame(void)
