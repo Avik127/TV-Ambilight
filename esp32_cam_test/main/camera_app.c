@@ -4,6 +4,7 @@
 #include "esp_camera.h"
 
 static const char *TAG = "camera_app";
+static bool s_jpeg_mode = false;
 
 // AI Thinker / common ESP32-CAM pin map
 #define PWDN_GPIO_NUM     32
@@ -81,6 +82,11 @@ esp_err_t camera_app_init(void)
 
     ESP_LOGI(TAG, "Camera initialized");
     return ESP_OK;
+}
+
+bool camera_app_is_jpeg_mode(void)
+{
+    return s_jpeg_mode;
 }
 
 camera_fb_t *camera_app_get_frame(void)

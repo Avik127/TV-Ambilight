@@ -267,7 +267,11 @@ static esp_err_t root_handler(httpd_req_t *req)
         "</script></body></html>";
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    if (camera_app_is_jpeg_mode()) {
+        httpd_resp_send(req, html_jpeg, HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send(req, html_rgb565, HTTPD_RESP_USE_STRLEN);
+    }
     return ESP_OK;
 }
 
