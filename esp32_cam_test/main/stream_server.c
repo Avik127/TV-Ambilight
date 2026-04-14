@@ -6,36 +6,33 @@
 #include "camera_app.h"
 
 static const char *TAG = "stream_server";
+static const int SW_JPEG_QUALITY = 20;
 
-#define SWAP_RGB565_BYTES 1
-
-static void write_u16_le(uint8_t *buf, int offset, uint16_t value)
+static esp_err_t send_frame_as_jpeg(httpd_req_t *req, camera_fb_t *fb, bool chunked)
 {
-    buf[offset + 0] = value & 0xFF;
-    buf[offset + 1] = (value >> 8) & 0xFF;
+    esp_err_t res;
+    if (fb->format == PIXFORMAT_JPEG) {
+        return chunked
+            ? httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len)
+            : httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    }
+
+    uint8_t *jpg_buf = NULL;
+    size_t jpg_len = 0;
+    bool converted = frame2jpg(fb, SW_JPEG_QUALITY, &jpg_buf, &jpg_len);
+    if (!converted || !jpg_buf) {
+        ESP_LOGE(TAG, "Software JPEG conversion failed");
+        return ESP_FAIL;
+    }
+
+    res = chunked
+        ? httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len)
+        : httpd_resp_send(req, (const char *)jpg_buf, jpg_len);
+    free(jpg_buf);
+    return res;
 }
 
-static void write_u32_le(uint8_t *buf, int offset, uint32_t value)
-{
-    buf[offset + 0] = value & 0xFF;
-    buf[offset + 1] = (value >> 8) & 0xFF;
-    buf[offset + 2] = (value >> 16) & 0xFF;
-    buf[offset + 3] = (value >> 24) & 0xFF;
-}
-
-static inline uint16_t swap_u16(uint16_t v)
-{
-    return (v >> 8) | (v << 8);
-}
-
-static inline void rgb565_to_rgb888(uint16_t pixel, uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    *r = ((pixel >> 11) & 0x1F) << 3;
-    *g = ((pixel >> 5) & 0x3F) << 2;
-    *b = (pixel & 0x1F) << 3;
-}
-
-static esp_err_t bmp_handler(httpd_req_t *req)
+static esp_err_t jpg_handler(httpd_req_t *req)
 {
     camera_fb_t *fb = camera_app_get_frame();
     if (!fb) {
@@ -43,72 +40,42 @@ static esp_err_t bmp_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    int width = fb->width;
-    int height = fb->height;
-    int row_size = ((width * 3 + 3) / 4) * 4;
-    int pixel_data_size = row_size * height;
-    int file_size = 54 + pixel_data_size;
+    httpd_resp_set_type(req, "image/jpeg");
+    esp_err_t res = send_frame_as_jpeg(req, fb, false);
+    camera_app_return_frame(fb);
+    return res;
+}
 
-    uint8_t header[54] = {0};
-    header[0] = 'B';
-    header[1] = 'M';
-    write_u32_le(header, 2, file_size);
-    write_u32_le(header, 10, 54);
-    write_u32_le(header, 14, 40);
-    write_u32_le(header, 18, width);
-    write_u32_le(header, 22, height);
-    write_u16_le(header, 26, 1);
-    write_u16_le(header, 28, 24);
-    write_u32_le(header, 34, pixel_data_size);
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+    static const char *BOUNDARY = "\r\n--frame\r\n";
+    static const char *PART = "Content-Type: image/jpeg\r\n\r\n";
 
-    httpd_resp_set_type(req, "image/bmp");
-    esp_err_t res = httpd_resp_send_chunk(req, (const char *)header, sizeof(header));
-    if (res != ESP_OK) {
-        camera_app_return_frame(fb);
-        httpd_resp_send_chunk(req, NULL, 0);
-        return res;
-    }
+    httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    uint8_t *row = malloc(row_size);
-    if (!row) {
-        camera_app_return_frame(fb);
-        httpd_resp_send_chunk(req, NULL, 0);
-        return ESP_FAIL;
-    }
-
-    uint16_t *pixels = (uint16_t *)fb->buf;
-
-    for (int y = height - 1; y >= 0; y--) {
-        memset(row, 0, row_size);
-
-        for (int x = 0; x < width; x++) {
-            uint16_t p = pixels[y * width + x];
-
-#if SWAP_RGB565_BYTES
-            p = swap_u16(p);
-#endif
-
-            uint8_t r, g, b;
-            rgb565_to_rgb888(p, &r, &g, &b);
-
-            row[x * 3 + 0] = b;
-            row[x * 3 + 1] = g;
-            row[x * 3 + 2] = r;
+    while (1) {
+        camera_fb_t *fb = camera_app_get_frame();
+        if (!fb) {
+            ESP_LOGW(TAG, "Camera capture failed");
+            return ESP_FAIL;
         }
 
-        esp_err_t res = httpd_resp_send_chunk(req, (const char *)row, row_size);
+        esp_err_t res = httpd_resp_send_chunk(req, BOUNDARY, strlen(BOUNDARY));
+        if (res == ESP_OK) {
+            res = httpd_resp_send_chunk(req, PART, strlen(PART));
+        }
+        if (res == ESP_OK) {
+            res = send_frame_as_jpeg(req, fb, true);
+        }
+
+        camera_app_return_frame(fb);
         if (res != ESP_OK) {
-            free(row);
-            camera_app_return_frame(fb);
-            httpd_resp_send_chunk(req, NULL, 0);
+            ESP_LOGI(TAG, "Stream client disconnected");
             return res;
         }
     }
-
-    free(row);
-    camera_app_return_frame(fb);
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
 }
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -120,9 +87,8 @@ static esp_err_t root_handler(httpd_req_t *req)
         "<script>"
         "const img = document.getElementById('cam');"
         "function refresh(){"
-        "  img.onload = () => setTimeout(refresh, 1200);"
-        "  img.onerror = () => setTimeout(refresh, 2000);"
-        "  img.src = '/bmp?t=' + Date.now();"
+        "  img.onerror = () => setTimeout(refresh, 1000);"
+        "  img.src = '/stream';"
         "}"
         "refresh();"
         "</script>"
@@ -150,15 +116,23 @@ esp_err_t stream_server_start(void)
         .user_ctx = NULL
     };
 
-    httpd_uri_t bmp_uri = {
-        .uri = "/bmp",
+    httpd_uri_t jpg_uri = {
+        .uri = "/jpg",
         .method = HTTP_GET,
-        .handler = bmp_handler,
+        .handler = jpg_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t stream_uri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = stream_handler,
         .user_ctx = NULL
     };
 
     httpd_register_uri_handler(server, &root_uri);
-    httpd_register_uri_handler(server, &bmp_uri);
+    httpd_register_uri_handler(server, &jpg_uri);
+    httpd_register_uri_handler(server, &stream_uri);
 
     ESP_LOGI(TAG, "HTTP server started");
     return ESP_OK;
