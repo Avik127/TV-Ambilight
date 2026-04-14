@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "camera_app.c"
+        "wifi_app.c"
+        "stream_server.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp32-camera
+        esp_wifi
+        esp_event
+        esp_netif
+        nvs_flash
+        esp_http_server
+)
