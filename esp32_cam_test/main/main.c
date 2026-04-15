@@ -1,6 +1,7 @@
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "camera_app.h"
+#include "calibration.h"
 #include "wifi_app.h"
 #include "stream_server.h"
 
@@ -12,6 +13,7 @@ static const char *TAG = "main";
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(calibration_init());
 
     ESP_LOGI(TAG, "Init camera");
     ESP_ERROR_CHECK(camera_app_init());

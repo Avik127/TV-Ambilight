@@ -2,6 +2,8 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_camera.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "camera_app";
 static bool s_jpeg_mode = false;
@@ -46,15 +48,15 @@ static esp_err_t camera_init_rgb565(void)
         .pin_href     = HREF_GPIO_NUM,
         .pin_pclk     = PCLK_GPIO_NUM,
 
-        .xclk_freq_hz = 20000000,
+        .xclk_freq_hz = 10000000,
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
         .pixel_format = PIXFORMAT_RGB565,
-        .frame_size   = FRAMESIZE_UXGA,
+        .frame_size   = FRAMESIZE_SVGA,
         .jpeg_quality = 12,
         .fb_count     = 1,
-        .grab_mode    = CAMERA_GRAB_LATEST,
+        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
         .fb_location  = CAMERA_FB_IN_PSRAM,
     };
 
@@ -69,19 +71,37 @@ esp_err_t camera_app_init(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "Camera initialized in RGB565 mode at UXGA");
+    ESP_LOGI(TAG, "Camera initialized in RGB565 mode at SVGA");
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_framesize(s, FRAMESIZE_UXGA);
+        s->set_framesize(s, FRAMESIZE_SVGA);
         s->set_brightness(s, 0);
         s->set_contrast(s, 0);
         s->set_saturation(s, 0);
         s->set_sharpness(s, 1);
     }
 
-    ESP_LOGI(TAG, "Camera initialized");
+    ESP_LOGI(TAG, "Camera initialized at SVGA (800x600)");
     return ESP_OK;
+}
+
+esp_err_t camera_app_recover(void)
+{
+    ESP_LOGW(TAG, "Camera DMA recovery: deinit + reinit");
+    esp_camera_deinit();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_err_t err = camera_init_rgb565();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera reinit failed: %s", esp_err_to_name(err));
+    } else {
+        sensor_t *s = esp_camera_sensor_get();
+        if (s) {
+            s->set_framesize(s, FRAMESIZE_SVGA);
+        }
+        ESP_LOGI(TAG, "Camera recovered");
+    }
+    return err;
 }
 
 bool camera_app_is_jpeg_mode(void)

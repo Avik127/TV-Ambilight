@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "camera_app.c"
+        "calibration.c"
         "wifi_app.c"
         "stream_server.c"
     INCLUDE_DIRS
