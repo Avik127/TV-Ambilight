@@ -7,22 +7,20 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
+#include "esp_camera.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "stream_server";
 
-static const int SW_JPEG_QUALITY        = 12;
 static const int DEFAULT_SEGMENTS       = 16;
 static const int DEFAULT_DEPTH          = 12;
 
-/* ── pixel helpers ─────────────────────────────────────────────────────── */
-
-static inline void rgb565_to_rgb888(uint16_t px, uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    *r = ((px >> 11) & 0x1F) << 3;
-    *g = ((px >>  5) & 0x3F) << 2;
-    *b = ( px        & 0x1F) << 3;
-}
+/* ── pixel helper ──────────────────────────────────────────────────────── */
 
 static inline int clamp_int(int v, int lo, int hi)
 {
@@ -43,24 +41,22 @@ static bool json_append(char *dst, size_t cap, size_t *len, const char *fmt, ...
     return true;
 }
 
-/* ── query-string helper ────────────────────────────────────────────────── */
+/* ── query-string helpers ───────────────────────────────────────────────── */
 
-static int read_query_int(httpd_req_t *req, const char *key,
-                          int fallback, int lo, int hi)
+/* Parse the full query string into a stack buffer once, then reuse it. */
+static int query_buf_get(httpd_req_t *req, char *buf, size_t cap)
 {
     size_t qlen = httpd_req_get_url_query_len(req);
-    if (!qlen) return fallback;
-    char *q = calloc(1, qlen + 1);
-    if (!q) return fallback;
-    int val = fallback;
-    if (httpd_req_get_url_query_str(req, q, qlen + 1) == ESP_OK) {
-        char param[16] = {0};
-        if (httpd_query_key_value(q, key, param, sizeof(param)) == ESP_OK) {
-            val = clamp_int(atoi(param), lo, hi);
-        }
-    }
-    free(q);
-    return val;
+    if (!qlen || qlen >= cap) return 0;
+    return httpd_req_get_url_query_str(req, buf, qlen + 1) == ESP_OK ? (int)qlen : 0;
+}
+
+static int query_int(const char *qbuf, const char *key, int fallback, int lo, int hi)
+{
+    if (!qbuf || !qbuf[0]) return fallback;
+    char param[16] = {0};
+    if (httpd_query_key_value(qbuf, key, param, sizeof(param)) != ESP_OK) return fallback;
+    return clamp_int(atoi(param), lo, hi);
 }
 
 /* ── calibration JSON parser ────────────────────────────────────────────── */
@@ -106,7 +102,7 @@ static bool parse_corner(const char *json, const char *key,
  * edges of an arbitrary (possibly skewed) quadrilateral.
  */
 static void sample_edge_strip(
-    const uint16_t *pixels, int W, int H,
+    const uint8_t *rgb, int W, int H,
     int ax, int ay, int bx, int by,
     int cent_x, int cent_y, int depth,
     long long *sum_r, long long *sum_g, long long *sum_b, int *count)
@@ -129,11 +125,10 @@ static void sample_edge_strip(
             int px = ex + idx * d / idist;
             int py = ey + idy * d / idist;
             if (px < 0 || px >= W || py < 0 || py >= H) break;
-            uint8_t r, g, b;
-            rgb565_to_rgb888(pixels[py * W + px], &r, &g, &b);
-            *sum_r += r;
-            *sum_g += g;
-            *sum_b += b;
+            int off = (py * W + px) * 3;
+            *sum_r += rgb[off];
+            *sum_g += rgb[off + 1];
+            *sum_b += rgb[off + 2];
             (*count)++;
         }
     }
@@ -173,6 +168,24 @@ static const char ROOT_HTML[] =
         "<span id='zl'>100</span>% "
         "<input type='range' min='50' max='200' value='100' id='zs' style='width:130px'>"
       "</label>"
+      "<label style='font-size:14px;color:#ccc'>Exp "
+        "<span id='el'>30</span> "
+        "<input type='range' min='0' max='300' value='30' id='es' style='width:130px'>"
+      "</label>"
+      "<label style='font-size:14px;color:#ccc'>Quality "
+        "<span id='ql'>30</span> "
+        "<input type='range' min='10' max='63' value='30' id='qs' style='width:130px'>"
+        "<span style='font-size:11px;color:#666'> (10=best 63=fastest)</span>"
+      "</label>"
+      "<label style='font-size:14px;color:#ccc'>Size "
+        "<select id='sz' style='background:#222;color:#eee;border:1px solid #555;padding:4px'>"
+          "<option value='5'>QVGA 320x240 (fastest)</option>"
+          "<option value='6'>CIF  400x296</option>"
+          "<option value='8' selected>VGA  640x480</option>"
+          "<option value='9'>SVGA 800x600</option>"
+          "<option value='10'>XGA 1024x768</option>"
+        "</select>"
+      "</label>"
     "</div>"
     "<div id='st'>Press Capture, then click: TL &rarr; TR &rarr; BR &rarr; BL</div>"
     "<div id='wrap'><canvas id='C'></canvas></div>"
@@ -195,6 +208,27 @@ static const char ROOT_HTML[] =
       "}"
     "}"
     "zs.oninput=applyZoom;"
+
+    "let _expT,_qlT;"
+    "const es=document.getElementById('es');"
+    "const el=document.getElementById('el');"
+    "es.oninput=()=>{"
+      "el.textContent=es.value;"
+      "clearTimeout(_expT);"
+      "_expT=setTimeout(()=>fetch('/settings?exp='+es.value),300);"
+    "};"
+
+    "const qs=document.getElementById('qs');"
+    "const ql=document.getElementById('ql');"
+    "qs.oninput=()=>{"
+      "ql.textContent=qs.value;"
+      "clearTimeout(_qlT);"
+      "_qlT=setTimeout(()=>fetch('/settings?quality='+qs.value),300);"
+    "};"
+
+    "document.getElementById('sz').onchange=function(){"
+      "fetch('/settings?size='+this.value);"
+    "};"
 
     "function draw(){"
       "if(!imgEl)return;"
@@ -274,7 +308,11 @@ static const char ROOT_HTML[] =
         "st.textContent='Calibration loaded. Capture to view on image.';"
       "}"
     "}).catch(()=>{});"
-    "</script></body></html>";
+    "</script>"
+    "<p style='margin-top:16px;font-size:13px;color:#666'>"
+      "<a href='/ota' style='color:#888'>Firmware update (OTA)</a>"
+    "</p>"
+    "</body></html>";
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
@@ -286,15 +324,12 @@ static esp_err_t root_handler(httpd_req_t *req)
 
 static esp_err_t jpg_handler(httpd_req_t *req)
 {
-    /* With GRAB_WHEN_EMPTY the buffer holds whatever was captured after the
-     * last fb_return() — i.e. the previous frame.  Discard it so we trigger
-     * a fresh DMA capture and the user sees the current scene. */
+    /* GRAB_WHEN_EMPTY: the buffer holds the previous frame. Flush it to
+     * trigger a fresh DMA capture, then block on the new frame. */
     camera_fb_t *stale = camera_app_get_frame();
     if (stale) {
-        camera_app_return_frame(stale);          /* triggers new DMA capture */
+        camera_app_return_frame(stale);
     } else {
-        /* DMA already corrupted — recover before the fresh grab */
-        ESP_LOGW(TAG, "Stale-frame flush timeout, recovering camera");
         if (camera_app_recover() != ESP_OK) {
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                 "Camera recovery failed");
@@ -302,13 +337,9 @@ static esp_err_t jpg_handler(httpd_req_t *req)
         }
     }
 
-    /* Grab the fresh frame — blocks until DMA finishes (~60-100 ms at 10 MHz) */
     camera_fb_t *fb = camera_app_get_frame();
     if (!fb) {
-        ESP_LOGW(TAG, "Fresh frame timeout, recovering camera");
-        if (camera_app_recover() == ESP_OK) {
-            fb = camera_app_get_frame();
-        }
+        if (camera_app_recover() == ESP_OK) fb = camera_app_get_frame();
         if (!fb) {
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                                 "Camera capture failed");
@@ -316,24 +347,11 @@ static esp_err_t jpg_handler(httpd_req_t *req)
         }
     }
 
-    /* Convert while holding the buffer (DMA is stopped).
-     * Release before HTTP send so DMA refills during TX. */
-    uint8_t *jpg     = NULL;
-    size_t   jpg_len = 0;
-    bool     ok      = frame2jpg(fb, SW_JPEG_QUALITY, &jpg, &jpg_len);
-    camera_app_return_frame(fb);   /* restart DMA now, not after send */
-
-    if (!ok || !jpg) {
-        ESP_LOGE(TAG, "JPEG conversion failed");
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "JPEG conversion failed");
-        return ESP_FAIL;
-    }
-
+    /* OV2640 hardware JPEG — frame buffer is already a JPEG, send directly. */
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
-    esp_err_t res = httpd_resp_send(req, (const char *)jpg, (ssize_t)jpg_len);
-    free(jpg);
+    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, (ssize_t)fb->len);
+    camera_app_return_frame(fb);
     return res;
 }
 
@@ -405,21 +423,39 @@ static esp_err_t edge_handler(httpd_req_t *req)
                             "Camera capture failed");
         return ESP_FAIL;
     }
-    if (fb->format != PIXFORMAT_RGB565) {
+    if (fb->format != PIXFORMAT_JPEG) {
         camera_app_return_frame(fb);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "Expected RGB565 format");
+                            "Expected JPEG format");
         return ESP_FAIL;
     }
 
     const int W        = (int)fb->width;
     const int H        = (int)fb->height;
-    const int segments = read_query_int(req, "segments", DEFAULT_SEGMENTS, 4, 64);
-    const int depth    = read_query_int(req, "depth",    DEFAULT_DEPTH,    2, 48);
-    const uint16_t *pixels = (const uint16_t *)fb->buf;
+    char qbuf[64];
+    query_buf_get(req, qbuf, sizeof(qbuf));
+    const int segments = query_int(qbuf, "segments", DEFAULT_SEGMENTS, 4, 64);
+    const int depth    = query_int(qbuf, "depth",    DEFAULT_DEPTH,    2, 48);
+
+    /* Decode hardware JPEG to RGB888 in PSRAM so we can sample pixels. */
+    uint8_t *rgb = heap_caps_malloc((size_t)W * H * 3,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rgb) {
+        camera_app_return_frame(fb);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM for decode");
+        return ESP_FAIL;
+    }
+    bool decoded = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, rgb);
+    camera_app_return_frame(fb);    /* release JPEG buffer as soon as decode is done */
+
+    if (!decoded) {
+        free(rgb);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JPEG decode failed");
+        return ESP_FAIL;
+    }
+
     const calibration_t cal = calibration_get();
 
-    /* centroid used for inward direction when calibrated */
     const int cent_x = cal.valid
         ? ((int)cal.tl.x + cal.tr.x + cal.br.x + cal.bl.x) / 4
         : W / 2;
@@ -430,7 +466,7 @@ static esp_err_t edge_handler(httpd_req_t *req)
     size_t cap  = 512 + (size_t)segments * 4 * 40;
     char  *json = malloc(cap);
     if (!json) {
-        camera_app_return_frame(fb);
+        free(rgb);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
@@ -443,13 +479,6 @@ static esp_err_t edge_handler(httpd_req_t *req)
         goto fail;
     }
 
-    /*
-     * Edge order and corner assignment:
-     *   0 top    TL -> TR
-     *   1 right  TR -> BR
-     *   2 bottom BL -> BR
-     *   3 left   TL -> BL
-     */
     static const char *const edge_names[4] = {"top", "right", "bottom", "left"};
 
     for (int edge = 0; edge < 4; edge++) {
@@ -487,7 +516,7 @@ static esp_err_t edge_handler(httpd_req_t *req)
                         by = cal.tl.y + (cal.bl.y - cal.tl.y) * (s + 1) / segments;
                         break;
                 }
-                sample_edge_strip(pixels, W, H, ax, ay, bx, by,
+                sample_edge_strip(rgb, W, H, ax, ay, bx, by,
                                   cent_x, cent_y, depth,
                                   &sum_r, &sum_g, &sum_b, &count);
             } else {
@@ -495,29 +524,27 @@ static esp_err_t edge_handler(httpd_req_t *req)
                 if (edge == 0 || edge == 2) { /* top / bottom */
                     int x0 =  s      * W / segments;
                     int x1 = (s + 1) * W / segments;
-                    int y0 = (edge == 0) ? 0         : H - depth;
-                    int y1 = (edge == 0) ? depth      : H;
+                    int y0 = (edge == 0) ? 0     : H - depth;
+                    int y1 = (edge == 0) ? depth : H;
                     y0 = clamp_int(y0, 0, H);
                     y1 = clamp_int(y1, 0, H);
                     for (int y = y0; y < y1; y++) {
                         for (int x = x0; x < x1; x++) {
-                            uint8_t r, g, b;
-                            rgb565_to_rgb888(pixels[y * W + x], &r, &g, &b);
-                            sum_r += r; sum_g += g; sum_b += b; count++;
+                            int off = (y * W + x) * 3;
+                            sum_r += rgb[off]; sum_g += rgb[off+1]; sum_b += rgb[off+2]; count++;
                         }
                     }
                 } else { /* right / left */
                     int y0 =  s      * H / segments;
                     int y1 = (s + 1) * H / segments;
                     int x0 = (edge == 1) ? W - depth : 0;
-                    int x1 = (edge == 1) ? W          : depth;
+                    int x1 = (edge == 1) ? W         : depth;
                     x0 = clamp_int(x0, 0, W);
                     x1 = clamp_int(x1, 0, W);
                     for (int y = y0; y < y1; y++) {
                         for (int x = x0; x < x1; x++) {
-                            uint8_t r, g, b;
-                            rgb565_to_rgb888(pixels[y * W + x], &r, &g, &b);
-                            sum_r += r; sum_g += g; sum_b += b; count++;
+                            int off = (y * W + x) * 3;
+                            sum_r += rgb[off]; sum_g += rgb[off+1]; sum_b += rgb[off+2]; count++;
                         }
                     }
                 }
@@ -537,7 +564,7 @@ static esp_err_t edge_handler(httpd_req_t *req)
     }
 
     if (!json_append(json, cap, &n, "}}\n")) goto fail;
-    camera_app_return_frame(fb);
+    free(rgb);
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t res = httpd_resp_send(req, json, (ssize_t)n);
@@ -545,10 +572,167 @@ static esp_err_t edge_handler(httpd_req_t *req)
     return res;
 
 fail:
+    free(rgb);
     free(json);
-    camera_app_return_frame(fb);
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON build failed");
     return ESP_FAIL;
+}
+
+/* GET /settings?exp=N&quality=N -------------------------------------------- */
+
+static esp_err_t settings_handler(httpd_req_t *req)
+{
+    char qbuf[64];
+    query_buf_get(req, qbuf, sizeof(qbuf));
+    int exp     = query_int(qbuf, "exp",     -1,  0, 1200);
+    int quality = query_int(qbuf, "quality", -1, 10,   63);
+    int size    = query_int(qbuf, "size",    -1,  0,   13);
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        if (exp >= 0)     { s->set_aec_value(s, exp);                        ESP_LOGI(TAG, "Exposure %d", exp); }
+        if (quality >= 0) { s->set_quality(s, quality);                       ESP_LOGI(TAG, "Quality %d", quality); }
+        if (size >= 0)    { s->set_framesize(s, (framesize_t)size);           ESP_LOGI(TAG, "Framesize %d", size); }
+    }
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "{\"exp\":%d,\"quality\":%d,\"size\":%d}",
+                     exp, quality, size);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buf, n);
+}
+
+/* GET /ota ----------------------------------------------------------------- */
+
+static const char OTA_HTML[] =
+    "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>OTA Update</title>"
+    "<style>"
+    "body{font-family:sans-serif;max-width:520px;margin:40px auto;padding:0 16px;"
+         "background:#111;color:#eee}"
+    "h1{margin:8px 0}"
+    "input{margin:12px 0;display:block;color:#eee;width:100%}"
+    "button{padding:10px 20px;background:#e67e22;color:#fff;border:none;"
+           "border-radius:4px;cursor:pointer;font-size:15px}"
+    "button:disabled{opacity:.5;cursor:not-allowed}"
+    "progress{width:100%;height:18px;margin-top:10px;display:none}"
+    "#st{margin-top:12px;color:#aaa}"
+    "a{color:#888}"
+    "</style></head><body>"
+    "<h1>OTA Firmware Update</h1>"
+    "<p>Select <code>build/esp32_cam_test.bin</code> then press Flash.</p>"
+    "<input type='file' id='f' accept='.bin'>"
+    "<button id='btn' onclick='upload()'>Flash</button>"
+    "<progress id='pg'></progress>"
+    "<div id='st'>Ready.</div>"
+    "<p><a href='/'>&#8592; Back to calibration</a></p>"
+    "<script>"
+    "function upload(){"
+      "const file=document.getElementById('f').files[0];"
+      "if(!file){alert('Select a .bin file first');return;}"
+      "const st=document.getElementById('st');"
+      "const pg=document.getElementById('pg');"
+      "const btn=document.getElementById('btn');"
+      "pg.style.display='block';pg.max=file.size;pg.value=0;"
+      "btn.disabled=true;"
+      "st.textContent='Uploading\u2026';"
+      "const xhr=new XMLHttpRequest();"
+      "xhr.open('POST','/ota');"
+      "xhr.upload.onprogress=e=>{"
+        "pg.value=e.loaded;"
+        "st.textContent=Math.round(e.loaded/e.total*100)+'%';"
+      "};"
+      "xhr.onload=()=>{"
+        "st.textContent=xhr.status===200"
+          "?'Done! Device is rebooting\u2026'"
+          ":'Error: '+xhr.responseText;"
+        "btn.disabled=false;"
+      "};"
+      "xhr.onerror=()=>{"
+        "st.textContent='Network error \u2014 device may have rebooted.';"
+        "btn.disabled=false;"
+      "};"
+      "xhr.send(file);"
+    "}"
+    "</script></body></html>";
+
+static esp_err_t ota_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, OTA_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+/* POST /ota ---------------------------------------------------------------- */
+
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "OTA start, image size: %d bytes", req->content_len);
+
+    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+    if (!target) {
+        ESP_LOGE(TAG, "No OTA partition found");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "No OTA partition — re-flash with USB first");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Writing to partition: %s at 0x%08lx", target->label, target->address);
+
+    esp_ota_handle_t handle;
+    esp_err_t err = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(4096);
+    if (!buf) {
+        esp_ota_abort(handle);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    int remaining = req->content_len;
+    while (remaining > 0) {
+        int want = remaining < 4096 ? remaining : 4096;
+        int got  = httpd_req_recv(req, buf, want);
+        if (got <= 0) {
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            ESP_LOGE(TAG, "Receive error: %d", got);
+            free(buf); esp_ota_abort(handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(handle, buf, got);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write: %s", esp_err_to_name(err));
+            free(buf); esp_ota_abort(handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash write failed");
+            return ESP_FAIL;
+        }
+        remaining -= got;
+    }
+    free(buf);
+
+    err = esp_ota_end(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "OTA validation failed — wrong image?");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Set boot partition failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA success — rebooting");
+    httpd_resp_sendstr(req, "OTA OK — rebooting");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -557,7 +741,13 @@ fail:
 
 esp_err_t stream_server_start(void)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
+    config.stack_size        = 8192;   /* OTA handler needs more than the default 4 KB */
+    config.recv_wait_timeout = 30;     /* allow slow WiFi during large OTA upload       */
+    config.send_wait_timeout = 30;
+    config.max_uri_handlers  = 10;
+    config.core_id           = 1;      /* APP_CPU: keep PRO_CPU (core 0) free for WiFi  */
+    config.lru_purge_enable  = true;   /* reclaim stale sockets so new requests aren't blocked */
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -575,6 +765,12 @@ esp_err_t stream_server_start(void)
         { .uri = "/calibration", .method = HTTP_POST, .handler = calibration_post_handler,
           .user_ctx = NULL },
         { .uri = "/edges",       .method = HTTP_GET,  .handler = edge_handler,
+          .user_ctx = NULL },
+        { .uri = "/ota",         .method = HTTP_GET,  .handler = ota_get_handler,
+          .user_ctx = NULL },
+        { .uri = "/ota",         .method = HTTP_POST, .handler = ota_post_handler,
+          .user_ctx = NULL },
+        { .uri = "/settings",    .method = HTTP_GET,  .handler = settings_handler,
           .user_ctx = NULL },
     };
 

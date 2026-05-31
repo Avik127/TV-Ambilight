@@ -27,7 +27,7 @@ static bool s_jpeg_mode = false;
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-static esp_err_t camera_init_rgb565(void)
+static esp_err_t camera_init(void)
 {
     camera_config_t config = {
         .pin_pwdn     = PWDN_GPIO_NUM,
@@ -48,13 +48,16 @@ static esp_err_t camera_init_rgb565(void)
         .pin_href     = HREF_GPIO_NUM,
         .pin_pclk     = PCLK_GPIO_NUM,
 
-        .xclk_freq_hz = 10000000,
+        /* OV2640 internal PLL requires 20 MHz XCLK to lock. */
+        .xclk_freq_hz = 20000000,
         .ledc_timer   = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
-        .pixel_format = PIXFORMAT_RGB565,
-        .frame_size   = FRAMESIZE_SVGA,
-        .jpeg_quality = 12,
+        /* Hardware JPEG: OV2640 encodes on-sensor; no software conversion needed.
+         * quality 10 = high quality, 63 = smallest/fastest. Adjustable live via /settings. */
+        .pixel_format = PIXFORMAT_JPEG,
+        .frame_size   = FRAMESIZE_XGA,
+        .jpeg_quality = 10,
         .fb_count     = 1,
         .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
         .fb_location  = CAMERA_FB_IN_PSRAM,
@@ -65,22 +68,14 @@ static esp_err_t camera_init_rgb565(void)
 
 esp_err_t camera_app_init(void)
 {
-    esp_err_t err = camera_init_rgb565();
+    esp_err_t err = camera_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_camera_init failed: %s", esp_err_to_name(err));
         return err;
     }
 
-    ESP_LOGI(TAG, "Camera initialized in RGB565 mode at SVGA");
-
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        s->set_framesize(s, FRAMESIZE_SVGA);
-        s->set_brightness(s, 0);
-        s->set_contrast(s, 0);
-        s->set_saturation(s, 0);
-        s->set_sharpness(s, 1);
-    }
+    s_jpeg_mode = true;
+    ESP_LOGI(TAG, "Camera initialized (OV2640 JPEG SVGA)");
 
     ESP_LOGI(TAG, "Camera initialized at SVGA (800x600)");
     return ESP_OK;
@@ -91,14 +86,10 @@ esp_err_t camera_app_recover(void)
     ESP_LOGW(TAG, "Camera DMA recovery: deinit + reinit");
     esp_camera_deinit();
     vTaskDelay(pdMS_TO_TICKS(200));
-    esp_err_t err = camera_init_rgb565();
+    esp_err_t err = camera_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera reinit failed: %s", esp_err_to_name(err));
     } else {
-        sensor_t *s = esp_camera_sensor_get();
-        if (s) {
-            s->set_framesize(s, FRAMESIZE_SVGA);
-        }
         ESP_LOGI(TAG, "Camera recovered");
     }
     return err;
